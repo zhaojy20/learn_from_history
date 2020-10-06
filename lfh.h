@@ -25,14 +25,16 @@ typedef struct myListCell myListCell;
 // Not like postgres structure XXX use palloc() to allocate the memory, the structure myXXX use malloc().
 // The reason is the memory allocated by palloc() would be free after each query executed.
 // But if we want to learn from the history, some data must maintain during the whole period.
-typedef struct myList {
+typedef struct myList
+{
 	NodeTag type; // The type is T_myList
 	int	length; // The length of the List
 	myListCell* head;
 	myListCell* tail;
-}myList;
+} myList;
 
-struct myListCell {
+struct myListCell
+{
 	void* data;
 	myListCell* next;
 };
@@ -51,7 +53,8 @@ struct myListCell {
 		AttrNumber	varoattno;		original value of varattno
 		int			location;		token location, or -1 if unknown
 	} Var; */
-typedef struct myVar {
+typedef struct myVar
+{
 	Expr xpr;
 	unsigned int relid; // The absolute label for base relation. The relids of base relation are consistent after they were built.
 	AttrNumber	varattno;
@@ -62,7 +65,7 @@ typedef struct myVar {
 	Index		varnoold;
 	AttrNumber	varoattno;
 	int			location;
-}myVar;
+} myVar;
 // The attribute "constvalue" in structure Const may be different even if the corresponding part in the SQL is same, so we need to do some adaptation in structure myConst.
 /* The definition of structure Const shows below
 typedef struct Const
@@ -77,7 +80,8 @@ bool constisnull;	whether the constant is null (if true, constvalue is undefined
 bool constbyval;		whether this datatype is passed by value. If true, then all the information is stored in the Datum. If false, then the Datum contains a pointer to the information.
 int location;		token location, or -1 if unknown
 } Const; */
-typedef struct myConst {
+typedef struct myConst
+{
 	Expr xpr;
 	Oid consttype;
 	int32 consttypmod;
@@ -87,47 +91,44 @@ typedef struct myConst {
 	bool constisnull;
 	bool constbyval;
 	int location;
-}myConst;
+} myConst;
 /* RestrictClause
 *  Every predicates after "WHERE" clause are turned into this structure.
 */
-typedef struct RestrictClause {
+typedef struct RestrictClause
+{
 	// Consider a predicate like "A operator B"
 	NodeTag type; // The type is T_RestrictClause
 	NodeTag rc_type; // Store operator
 	Expr* left; // Store A
 	Expr* right; // Store B
-}RestrictClause;
+} RestrictClause;
 /* sturct myRelInfo
 *  The entity of relations, including base relation and temporary relation.
 *  If the relation is a base relation, relid is not 0, childRelList and joininfo is NULL, while RestrictClauseList may not be NULL.
 *  If the relation is a temporary relation, relid equal to 0, RestrictClauseList is NULL, but childRelList and joininfo is not NULL.
 */
-typedef struct myRelInfo {
+typedef struct myRelInfo
+{
 	//Consider C = A join B, A and B are base relation and C is a temporary relation
 	NodeTag type; // The type is T_myRelInfo
 	unsigned int relid; // If the relation is a base relation, relid is not 0; If the relation is a temporary relation, relid equal to 0.
 	myList* RestrictClauseList; // List of baserestrict clause(RestrictClause*), like "A.age > 15 AND A.salary > 1500".
 	myList* childRelList; // The table previous join, like A->B
 	myList* joininfo; // The join predicate between childRel
-}myRelInfo;
+} myRelInfo;
 /* struct History
 *  If a temporary relation appears first time, it will be recorded as a History when the SQL is executing.
 *  If the temporary relation have already appeared in the previous query, we return the selectivity to help caculating the tuples more accurate.
 *  The value of attribute "selec" will be assigned after the SQL query is executed.
 */
-typedef struct History {
+typedef struct History
+{
 	//Consider C = A join B
 	NodeTag type; // The type is T_History
 	myRelInfo* content; //The entity of this relation
 	Selectivity selec; // The selectivity
-}History;
-//comapre a and b. If same, return true.
-bool my_equal(const void* a, const void* b); 
-// make a copy of from.
-void* my_copyVar(const PlannerInfo* root, const Var* from); 
-// make a copy of from.
-void* my_copyConst(const PlannerInfo* root, const Const* from);
+} History;
 /* Because we always add same base relation into different temporary relations' childRelList, making an array of base relations let us don't need to substantialize base relation each time during a SQL query */
 void initial_myRelInfoArray(const PlannerInfo* root);
 /* When opimizer meet a temporary relation check if we meet it before. If so return the true selectivity, if not, add the relation into a list of history */
