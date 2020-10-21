@@ -12,6 +12,7 @@
 #include "postgres.h"
 #include "optimizer/lfh.h"
 #include "nodes/bitmapset.h"
+#include "utils/rel.h"
 #include <stdlib.h>
 #include "utils/hashutils.h"
 
@@ -56,9 +57,13 @@ bool _equalmyList(myList *a, myList *b)
 bool _equalmyRelInfo(myRelInfo* a, myRelInfo* b)
 {
 	COMPARE_SCALAR_FIELD(relid);
-	if(_equalmyList(a->RestrictClauseList, b->RestrictClauseList) 
-		&& _equalmyList(a->childRelList, b->childRelList) 
-		&& _equalmyList(a->joininfo, b->joininfo))
+	if (!_equalmyList(a->RestrictClauseList, b->RestrictClauseList))
+		return false;
+	if (!_equalmyList(a->joininfo, b->joininfo))
+		return false;
+	if (_equalmyList(a->leftList, b->leftList) && _equalmyList(a->rightList, b->rightList))
+		return true;
+	if (_equalmyList(a->leftList, b->rightList) && _equalmyList(a->rightList, b->leftList))
 		return true;
 	return false;
 }
@@ -67,6 +72,8 @@ bool _equalRestrictClause(RestrictClause* a, RestrictClause* b)
 {
 	COMPARE_SCALAR_FIELD(rc_type);
 	if(my_equal(a->left, b->left) && my_equal(a->right, b->right))
+		return true;
+	if (my_equal(a->left, b->right) && my_equal(a->right, b->left))
 		return true;
 	return false;
 }
@@ -194,7 +201,8 @@ void* my_copyConst(PlannerInfo* root, const Const* from)
 	return newnode;
 }
 /* Make a copy of myRelInfo. */
-void* my_copyRelInfo(PlannerInfo* root, const myRelInfo* from) {
+void* my_copyRelInfo(PlannerInfo* root, const myRelInfo* from)
+{
 	if (from == NULL)
 		return NULL;
 	Node* temp = (Node*)malloc(sizeof(myRelInfo));
@@ -207,8 +215,10 @@ void* my_copyRelInfo(PlannerInfo* root, const myRelInfo* from) {
 	{
 		newnode->relid = ((myRelInfo*)from)->relid;
 		newnode->RestrictClauseList = ((myRelInfo*)from)->RestrictClauseList;
-		newnode->childRelList = ((myRelInfo*)from)->childRelList;
+		newnode->leftList = ((myRelInfo*)from)->leftList;
+		newnode->rightList = ((myRelInfo*)from)->rightList;
 		newnode->joininfo = ((myRelInfo*)from)->joininfo;
+		newnode->tuples = ((myRelInfo*)from)->tuples;
 	}
 	return newnode;
 }
@@ -324,10 +334,15 @@ void* getChildList(PlannerInfo* root, RelOptInfo* rel)
 			ans = ListRenew(ans, temp);
 		}
 	}
+	else
+	{
+		myRelInfo* temp = myRelInfoArray[rel->relid];
+		ans = ListRenew(ans, temp);
+	}
 	return ans;
 }
 /* Make a entity of relation */
-myRelInfo* CreateNewRel(const PlannerInfo* root, const RelOptInfo* rel, const List* joininfo)
+myRelInfo* CreateNewRel(const PlannerInfo* root, const RelOptInfo* rel, const RelOptInfo* old_rel, const RelOptInfo* new_rel, const List* joininfo)
 {
 	myRelInfo* ans = (myRelInfo*)malloc(sizeof(myRelInfo));
 	ans->type = T_myRelInfo;
@@ -337,9 +352,11 @@ myRelInfo* CreateNewRel(const PlannerInfo* root, const RelOptInfo* rel, const Li
 	if (rel->relid != 0)
 	{
 		ans->relid = root->simple_rte_array[rel->relid]->relid;
-		ans->childRelList = (myList*)NULL;
+		ans->leftList = (myList*)NULL;
+		ans->rightList = (myList*)NULL;
 		ans->RestrictClauseList = getRestrictClause(root, rel->baserestrictinfo);
 		ans->joininfo = (myList*)NULL;
+		ans->tuples = rel->rows;
 	}
 	/*
 	*  If rel is a temporary relation, child relation and joininfo is useful. But no restriction information because obviously the filter predicate is only applied on the base relation.
@@ -347,9 +364,11 @@ myRelInfo* CreateNewRel(const PlannerInfo* root, const RelOptInfo* rel, const Li
 	else
 	{
 		ans->relid = 0;
-		ans->childRelList = getChildList(root, rel);
+		ans->leftList = getChildList(root, old_rel);
+		ans->rightList = getChildList(root, new_rel);
 		ans->RestrictClauseList = (myList*)NULL;
 		ans->joininfo = getRestrictClause(root, joininfo);
+		ans->tuples = 0.0;
 	}
 	return ans;
 }
@@ -360,10 +379,11 @@ void* CreateNewHistory(const myRelInfo* rel)
 	temp->type = T_History;
 	temp->content = rel;
 	temp->selec = -1.0;
+	temp->is_true = false;
 	return temp;
 }
 /* Check myList CheckList find out if we meet this rel before ? */
-bool LookupHistory(const myRelInfo* rel, Selectivity* selec)
+History* LookupHistory(const myRelInfo* rel)
 {
 	myListCell* lc;
 	foreach_myList(lc, CheckList)
@@ -371,11 +391,10 @@ bool LookupHistory(const myRelInfo* rel, Selectivity* selec)
 		History* one_page = ((History*)lc->data);
 		if (my_equal(one_page->content, rel))
 		{
-			*selec = one_page->selec;
-			return true;
+			return one_page;
 		}
 	}
-	return false;
+	return NULL;
 }
 /* initialize the array myRelInfoArray */
 void initial_myRelInfoArray(const PlannerInfo* root)
@@ -399,21 +418,28 @@ bool learn_from_history(const PlannerInfo* root, const RelOptInfo* joinrel,
 	if ((outer_rel->relid != 0) && (myRelInfoArray[outer_rel->relid] == NULL))
 	{
 		/* Make a entity of a base relation */
-		myRelInfo* rel = CreateNewRel(root, outer_rel, joininfo);
+		myRelInfo* rel = CreateNewRel(root, outer_rel, NULL, NULL, joininfo);
 		/* Add it to the myRelInfoArray */
 		myRelInfoArray[outer_rel->relid] = rel;
 	}
-	if ((inner_rel->relid != 0) && (myRelInfoArray[outer_rel->relid] == NULL))
+	if ((inner_rel->relid != 0) && (myRelInfoArray[inner_rel->relid] == NULL))
 	{
 		/* Make a entity of a base relation */
-		myRelInfo* rel = CreateNewRel(root, inner_rel, joininfo);
+		myRelInfo* rel = CreateNewRel(root, inner_rel, NULL, NULL, joininfo);
 		/* Add it to the myRelInfoArray */
 		myRelInfoArray[inner_rel->relid] = rel;
 	}
-	/* Make a entity of a temporary relation */
-	myRelInfo* rel = CreateNewRel(root, joinrel, joininfo);
+	myRelInfo* rel;
+	if (outer_rel->relid != 0) {
+		/* Make a entity of a temporary relation */
+		rel = CreateNewRel(root, joinrel, inner_rel, outer_rel, joininfo);
+	}
+	else {
+		rel = CreateNewRel(root, joinrel, outer_rel, inner_rel, joininfo);
+	}
 	/* If we have met this temporary relation before ? */
-	if (!LookupHistory(rel, selec))
+	History* his = LookupHistory(rel, selec);
+	if (his == NULL)
 	{
 		/* If not, we add this temporary relation to the list of History */
 		History* one_page = (History*)CreateNewHistory(rel);
@@ -421,6 +447,10 @@ bool learn_from_history(const PlannerInfo* root, const RelOptInfo* joinrel,
 		/* And return false imply that we haven't met this temporary relation before */
 		return false;
 	}
+	if (his->selec > -1.0)
+		*selec = his->selec;
+	else
+		return false;
 	/* If yes, we return true, and the true selectivity has been assigned to input Selectivity* selec in the function LookupHistory() */
 	return true;
 }
@@ -429,14 +459,20 @@ bool learn_from_history(const PlannerInfo* root, const RelOptInfo* joinrel,
 *  One relation's child relations store in t_array, another's in rel->chidRelList.
 *  We compare them and if they are same, return ture.
 */
-bool isCorrRel(const QueryDesc* queryDesc, myRelInfo* rel, const int* t_array)
+bool isEqualRel(const QueryDesc* queryDesc, myRelInfo* rel, const int* t_array)
 {
 	int cnt = 0;
 	int i = 0;
-	while (t_array[i] != 0)
+	while (t_array[i] != 0) {
+		i++;
+	}
+	int array_cnt = i;
+	myListCell* lc;
+	if (rel->leftList->length + rel->rightList->length != array_cnt)
+		return false;
+	foreach_myList(lc, rel->leftList)
 	{
-		myListCell* lc;
-		foreach_myList(lc, rel->childRelList)
+		for (int i = 0; t_array[i] != 0; i++)
 		{
 			if (((myRelInfo*)lc->data)->relid == t_array[i])
 			{
@@ -444,9 +480,67 @@ bool isCorrRel(const QueryDesc* queryDesc, myRelInfo* rel, const int* t_array)
 				break;
 			}
 		}
+	}
+	if (rel->leftList->length != cnt)
+		return false;
+	foreach_myList(lc, rel->rightList)
+	{
+		for (int i = 0; t_array[i] != 0; i++)
+		{
+			if (((myRelInfo*)lc->data)->relid == t_array[i])
+			{
+				cnt++;
+				break;
+			}
+		}
+	}
+	if (cnt == array_cnt)
+	{
+		return true;
+	}
+	return false;
+}
+/* isSupRel
+*  If one temporary relations is another's superior relation, their leftList includes another's leftList, and their rightList includes another's rightList.
+*  One relation's child relations store in t_array, another's in rel->chidRelList.
+*  We compare them and if they are same, return ture.
+*/
+bool isSupRel(const QueryDesc* queryDesc, myRelInfo* rel, const int* t_array)
+{
+	int cnt = 0;
+	int i = 0;
+	while (t_array[i] != 0) {
 		i++;
 	}
-	if (cnt == i)
+	int array_cnt = i;
+	myListCell* lc;
+	if (rel->leftList->length + rel->rightList->length <= array_cnt)
+		return false;
+	foreach_myList(lc, rel->leftList)
+	{
+		for (int i = 0; t_array[i] != 0; i++)
+		{
+			if (((myRelInfo*)lc->data)->relid == t_array[i])
+			{
+				cnt++;
+				break;
+			}
+		}
+	}
+	if ((cnt == 0) || (cnt == array_cnt))
+		return false;
+	foreach_myList(lc, rel->rightList)
+	{
+		for (int i = 0; t_array[i] != 0; i++)
+		{
+			if (((myRelInfo*)lc->data)->relid == t_array[i])
+			{
+				cnt++;
+				break;
+			}
+		}
+	}
+	if (cnt == array_cnt)
 	{
 		return true;
 	}
@@ -460,12 +554,11 @@ void FindComponent(QueryDesc* queryDesc, Plan* plan, int* t_array)
 	switch (plan->type)
 	{
 		case T_Scan:
+		case T_SeqScan:
+		case T_IndexScan:
+		case T_BitmapIndexScan:
 		{
 			Scan* scanplan = (Scan*)plan;
-		}
-		case T_SeqScan:
-		{
-			SeqScan* scanplan = (SeqScan*)plan;
 			int i = 0;
 			while (t_array[i] != 0)
 			{
@@ -484,25 +577,7 @@ void FindComponent(QueryDesc* queryDesc, Plan* plan, int* t_array)
 		}
 	}
 }
-/* FindCorHistory
-*  Given a temporary relation(plan), find its corresponding History. 
-*/
-History* FindCorHistory(const QueryDesc* queryDesc, const Plan* plan) 
-{
-	int n = queryDesc->estate->es_range_table_size + 1;
-	unsigned int* t_array = malloc(n * sizeof(unsigned int));
-	memset(t_array, 0, n * sizeof(unsigned int));
-	FindComponent(queryDesc, plan, t_array);
-	myListCell* lc;
-	foreach_myList(lc, CheckList)
-	{
-		if (isCorrRel(queryDesc, ((History*)lc->data)->content, t_array))
-		{
-			return ((History*)lc->data);
-		}
-	}
-	return (History*)NULL;
-}
+
 /* After executor, we call this function to get the true selectivity for each temporary relation we stored in function learn_from_history().
 *  Use recursion to transverse the PlanState to get the true cardinality.
 */
@@ -511,24 +586,130 @@ int learnSelectivity(const QueryDesc* queryDesc, const PlanState* planstate)
 	Plan* plan = planstate->plan;
 	// When we meet SeqScan, we reach the end of PlanState tree.
 	if (plan->type == T_SeqScan)
-		return plan->plan_rows;
+	{
+		return myRelInfoArray[((SeqScan*)plan)->scanrelid]->tuples;
+	}
+	else if (plan->type == T_BitmapHeapScan)
+	{
+		return learnSelectivity(queryDesc, planstate->lefttree);
+	}
+	else if (plan->type == T_BitmapIndexScan)
+	{
+		return myRelInfoArray[((BitmapIndexScan*)plan)->scan.scanrelid]->tuples;
+	}
+	else if (plan->type == T_IndexScan)
+	{
+		return myRelInfoArray[((IndexScan*)plan)->scan.scanrelid]->tuples;
+	}
+	else if (plan->type == T_Hash)
+	{
+		return planstate->instrument->tuplecount;
+	}
 	int left_tuple = -1, right_tuple = -1;
 	History* his = (History*)NULL;
+	int n = queryDesc->estate->es_range_table_size + 1;
+	Assert(n > 1);
+	unsigned int* left_array = malloc(n * sizeof(unsigned int));
+	memset(left_array, 0, n * sizeof(unsigned int));
 	// Get the true cardinality of the lefttree if exists.
-	if(planstate->lefttree)
+	if (planstate->lefttree) {
 		left_tuple = learnSelectivity(queryDesc, planstate->lefttree);
+		FindComponent(queryDesc, planstate->lefttree->plan, left_array);
+	}
+	unsigned int* right_array = malloc(n * sizeof(unsigned int));
+	memset(right_array, 0, n * sizeof(unsigned int));
 	// Get the true cardinality of the righttree if exists.
-	if(planstate->righttree)
+	if (planstate->righttree){
 		right_tuple = learnSelectivity(queryDesc, planstate->righttree);
+		FindComponent(queryDesc, planstate->righttree->plan, right_array);
+	}
+	int lsize;
+	int rsize;
+	unsigned int* total_array = malloc(n * sizeof(unsigned int));
 	// The if clause is used to exclude T_Hash Node
-	if((left_tuple != -1) && (right_tuple != -1))
+	if ((left_tuple != -1) && (right_tuple != -1)) {
 		/* This PlanState Node represent a temporary relation
 		*  And we need to find out the corresponding History
 		*/
-		his = FindCorHistory(queryDesc, plan);
-	if(his)
+		memset(total_array, 0, n * sizeof(unsigned int));
+		for (lsize = 0; left_array[lsize] != 0; lsize++) {
+			total_array[lsize] = left_array[lsize];
+		}
+		for (rsize = 0; right_array[rsize] != 0; rsize++) {
+			total_array[lsize + rsize] = right_array[rsize];
+		}
+		myListCell *lc;
+		foreach_myList(lc, CheckList)
+		{
+			if (isEqualRel(queryDesc, ((History*)lc->data)->content, total_array))
+			{
+				his = ((History*)lc->data);
+				break;
+			}
+		}
+	}
+	if (his) {
 		/* If we find a corresponding History get the true selectivity */
 		his->selec = planstate->instrument->tuplecount / left_tuple / right_tuple;
+		his->is_true = true;
+		//由高级表推断2级表的selectivity
+		if (lsize + rsize > 2) {
+			unsigned int t_array[3] = { 0, 0, 0 };
+			for (int i = 0; i < rsize; i++) {
+				for (int j = 0; j < lsize; j++) {
+					t_array[0] = right_array[i];
+					t_array[1] = left_array[j];
+					myListCell* lc;
+					History* temp = (History*)NULL;
+					foreach_myList(lc, CheckList)
+					{
+						//存在这样一个符合推断条件的2级表temp
+						if ((((History*)lc->data)->is_true == false) && (isEqualRel(queryDesc, ((History*)lc->data)->content, t_array)))
+						{
+							temp = ((History*)lc->data);
+							if (temp->selec == -1.0)
+								temp->selec = his->selec;
+							temp->selec = (temp->selec > his->selec)? his->selec : temp->selec;
+							break;
+						}
+					}
+					//由2级表temp推断高级表sup_temp的selectivity
+					/*if (temp)
+					{
+						myListCell* lc1;
+						foreach_myList(lc1, CheckList)
+						{
+							if ((((History*)lc1->data)->is_true == false) && (isSupRel(queryDesc, ((History*)lc1->data)->content, t_array)))
+							{
+								History* sup_temp = ((History*)lc1->data);
+								if (sup_temp->selec == -1.0)
+									sup_temp->selec = temp->selec;
+								sup_temp->selec = (temp->selec > sup_temp->selec) ? temp->selec : sup_temp->selec;
+							}
+						}
+					}*/
+				}
+			}
+		}
+		//由2级表his推断高级表sup_temp的selectivity
+		/*else
+		{
+			myListCell* lc;
+			foreach_myList(lc, CheckList)
+			{
+				if ((((History*)lc->data)->is_true == false) && (isSupRel(queryDesc, ((History*)lc->data)->content, total_array)))
+				{
+					History* sup_temp = ((History*)lc->data);
+					if (sup_temp->selec == -1.0)
+						sup_temp->selec = his->selec;
+					sup_temp->selec = (his->selec > sup_temp->selec) ? his->selec : sup_temp->selec;
+				}
+			}
+		}*/
+	}
 	/* Return the true cardinality of this Node */
+	free(left_array);
+	free(right_array);
+	free(total_array);
 	return planstate->instrument->tuplecount;
 }

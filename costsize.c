@@ -4587,6 +4587,7 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 	 * join strength reduction.)  fkselec gets the net selectivity for
 	 * FK-matching clauses, or 1.0 if there are none.
 	 */
+	//fkselec = get_foreign_key_join_selectivity(root, outer_rel->relids, inner_rel->relids, sjinfo, &restrictlist);
 	fkselec = flag ? fkselec : get_foreign_key_join_selectivity(root, outer_rel->relids, inner_rel->relids, sjinfo, &restrictlist);
 
 	/*
@@ -4612,6 +4613,11 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 		}
 
 		/* Get the separate selectivities */
+		//jselec = clauselist_selectivity(root,
+		//	               joinquals,
+		//	               0,
+		//	               jointype,
+		//	               sjinfo);
 		jselec = flag ? 1.0 : clauselist_selectivity(root,
 										joinquals,
 										0,
@@ -4629,6 +4635,7 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 	}
 	else
 	{
+		//jselec = clauselist_selectivity(root, restrictlist, 0, jointype, sjinfo);
 		jselec = flag ? 1.0 : clauselist_selectivity(root, restrictlist, 0, jointype, sjinfo);
 		pselec = 0.0;			/* not used, keep compiler quiet */
 	}
