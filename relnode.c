@@ -21,7 +21,6 @@
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/inherit.h"
-#include "optimizer/lfh.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/placeholder.h"
@@ -31,6 +30,8 @@
 #include "partitioning/partbounds.h"
 #include "utils/hsearch.h"
 
+#include "optimizer/lfh.h"
+#include "optimizer/mySelectivity.h"
 
 typedef struct JoinHashEntry
 {
@@ -585,11 +586,16 @@ build_join_rel(PlannerInfo *root,
 		 * pair of component relations.
 		 */
 		if (restrictlist_ptr)
-			*restrictlist_ptr = build_joinrel_restrictlist(root,
-														   joinrel,
-														   outer_rel,
-														   inner_rel);
-		learn_from_history(root, joinrel, outer_rel, inner_rel, *restrictlist_ptr, NULL);
+			*restrictlist_ptr = build_joinrel_restrictlist(root, joinrel, outer_rel, inner_rel);
+		mySelectivity* myselec = palloc(sizeof(mySelectivity));
+		bool flag = learn_from_history(root, joinrel, outer_rel, inner_rel, *restrictlist_ptr, myselec);
+		if (flag) {
+			double max = outer_rel->rows * inner_rel->rows * myselec->max_selec;
+			double min = outer_rel->rows * inner_rel->rows * myselec->min_selec;
+			if ((max < joinrel->rows) || (joinrel->rows < min)) {
+				joinrel->rows = outer_rel->rows * inner_rel->rows * myselec->selec;
+			}
+		}
 		return joinrel;
 	}
 
