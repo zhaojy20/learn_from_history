@@ -85,7 +85,6 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
-#include "optimizer/lfh.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -98,6 +97,9 @@
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
 #include "utils/tuplesort.h"
+
+#include "optimizer/lfh.h"
+#include "optimizer/mySelectivity.h"
 
 #define LOG2(x)  (log(x) / 0.693147180559945)
 
@@ -4571,75 +4573,70 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 	Selectivity pselec;
 	double		nrows;
 	bool flag = false;
-	flag = learn_from_history(root, joinrel, outer_rel, inner_rel, restrictlist, &fkselec);
-	/*
-	 * Compute joinclause selectivity.  Note that we are only considering
-	 * clauses that become restriction clauses at this join level; we are not
-	 * double-counting them because they were not considered in estimating the
-	 * sizes of the component rels.
-	 *
-	 * First, see whether any of the joinclauses can be matched to known FK
-	 * constraints.  If so, drop those clauses from the restrictlist, and
-	 * instead estimate their selectivity using FK semantics.  (We do this
-	 * without regard to whether said clauses are local or "pushed down".
-	 * Probably, an FK-matching clause could never be seen as pushed down at
-	 * an outer join, since it would be strict and hence would be grounds for
-	 * join strength reduction.)  fkselec gets the net selectivity for
-	 * FK-matching clauses, or 1.0 if there are none.
-	 */
-	//fkselec = get_foreign_key_join_selectivity(root, outer_rel->relids, inner_rel->relids, sjinfo, &restrictlist);
-	fkselec = flag ? fkselec : get_foreign_key_join_selectivity(root, outer_rel->relids, inner_rel->relids, sjinfo, &restrictlist);
-
-	/*
-	 * For an outer join, we have to distinguish the selectivity of the join's
-	 * own clauses (JOIN/ON conditions) from any clauses that were "pushed
-	 * down".  For inner joins we just count them all as joinclauses.
-	 */
-	if (IS_OUTER_JOIN(jointype))
+	mySelectivity* selec = palloc(sizeof(mySelectivity));
+	flag = learn_from_history(root, joinrel, outer_rel, inner_rel, restrictlist, selec);
+	if (!flag)
 	{
-		List	   *joinquals = NIL;
-		List	   *pushedquals = NIL;
-		ListCell   *l;
+		/*
+		 * Compute joinclause selectivity.  Note that we are only considering
+		 * clauses that become restriction clauses at this join level; we are not
+		 * double-counting them because they were not considered in estimating the
+		 * sizes of the component rels.
+		 *
+		 * First, see whether any of the joinclauses can be matched to known FK
+		 * constraints.  If so, drop those clauses from the restrictlist, and
+		 * instead estimate their selectivity using FK semantics.  (We do this
+		 * without regard to whether said clauses are local or "pushed down".
+		 * Probably, an FK-matching clause could never be seen as pushed down at
+		 * an outer join, since it would be strict and hence would be grounds for
+		 * join strength reduction.)  fkselec gets the net selectivity for
+		 * FK-matching clauses, or 1.0 if there are none.
+		 */
+		 //fkselec = get_foreign_key_join_selectivity(root, outer_rel->relids, inner_rel->relids, sjinfo, &restrictlist);
+		fkselec = get_foreign_key_join_selectivity(root, outer_rel->relids, inner_rel->relids, sjinfo, &restrictlist);
 
-		/* Grovel through the clauses to separate into two lists */
-		foreach(l, restrictlist)
+		/*
+		 * For an outer join, we have to distinguish the selectivity of the join's
+		 * own clauses (JOIN/ON conditions) from any clauses that were "pushed
+		 * down".  For inner joins we just count them all as joinclauses.
+		 */
+		if (IS_OUTER_JOIN(jointype))
 		{
-			RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
+			List* joinquals = NIL;
+			List* pushedquals = NIL;
+			ListCell* l;
 
-			if (RINFO_IS_PUSHED_DOWN(rinfo, joinrel->relids))
-				pushedquals = lappend(pushedquals, rinfo);
-			else
-				joinquals = lappend(joinquals, rinfo);
+			/* Grovel through the clauses to separate into two lists */
+			foreach(l, restrictlist)
+			{
+				RestrictInfo* rinfo = lfirst_node(RestrictInfo, l);
+
+				if (RINFO_IS_PUSHED_DOWN(rinfo, joinrel->relids))
+					pushedquals = lappend(pushedquals, rinfo);
+				else
+					joinquals = lappend(joinquals, rinfo);
+			}
+
+			/* Get the separate selectivities */
+			//jselec = clauselist_selectivity(root,
+			//	               joinquals,
+			//	               0,
+			//	               jointype,
+			//	               sjinfo);
+			jselec = myclauselist_selectivity(root, joinquals, 0, jointype, sjinfo)->selec;
+			pselec = myclauselist_selectivity(root, pushedquals, 0, jointype, sjinfo)->selec;
+			/* Avoid leaking a lot of ListCells */
+			list_free(joinquals);
+			list_free(pushedquals);
 		}
-
-		/* Get the separate selectivities */
-		//jselec = clauselist_selectivity(root,
-		//	               joinquals,
-		//	               0,
-		//	               jointype,
-		//	               sjinfo);
-		jselec = flag ? 1.0 : clauselist_selectivity(root,
-										joinquals,
-										0,
-										jointype,
-										sjinfo);
-		pselec = clauselist_selectivity(root,
-										pushedquals,
-										0,
-										jointype,
-										sjinfo);
-
-		/* Avoid leaking a lot of ListCells */
-		list_free(joinquals);
-		list_free(pushedquals);
+		else
+		{
+			//jselec = clauselist_selectivity(root, restrictlist, 0, jointype, sjinfo);
+			jselec = myclauselist_selectivity(root, restrictlist, 0, jointype, sjinfo)->selec;
+			pselec = 0.0;			/* not used, keep compiler quiet */
+		}
+		selec->selec = fkselec * jselec;
 	}
-	else
-	{
-		//jselec = clauselist_selectivity(root, restrictlist, 0, jointype, sjinfo);
-		jselec = flag ? 1.0 : clauselist_selectivity(root, restrictlist, 0, jointype, sjinfo);
-		pselec = 0.0;			/* not used, keep compiler quiet */
-	}
-
 	/*
 	 * Basically, we multiply size of Cartesian product by selectivity.
 	 *
@@ -4655,17 +4652,17 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 	switch (jointype)
 	{
 		case JOIN_INNER:
-			nrows = outer_rows * inner_rows * fkselec * jselec;
+			nrows = outer_rows * inner_rows * selec->selec;
 			/* pselec not used */
 			break;
 		case JOIN_LEFT:
-			nrows = outer_rows * inner_rows * fkselec * jselec;
+			nrows = outer_rows * inner_rows * selec->selec;
 			if (nrows < outer_rows)
 				nrows = outer_rows;
 			nrows *= pselec;
 			break;
 		case JOIN_FULL:
-			nrows = outer_rows * inner_rows * fkselec * jselec;
+			nrows = outer_rows * inner_rows * selec->selec;
 			if (nrows < outer_rows)
 				nrows = outer_rows;
 			if (nrows < inner_rows)
@@ -4673,11 +4670,11 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 			nrows *= pselec;
 			break;
 		case JOIN_SEMI:
-			nrows = outer_rows * fkselec * jselec;
+			nrows = outer_rows * selec->selec;
 			/* pselec not used */
 			break;
 		case JOIN_ANTI:
-			nrows = outer_rows * (1.0 - fkselec * jselec);
+			nrows = outer_rows * (1.0 - selec->selec);
 			nrows *= pselec;
 			break;
 		default:

@@ -15,7 +15,8 @@
 #include "utils/rel.h"
 #include <stdlib.h>
 #include "utils/hashutils.h"
-
+#include "optimizer/mySelectivity.h"
+#include "test.h"
 #define COMPARE_SCALAR_FIELD(fldname) do { if (a->fldname != b->fldname) return false;} while (0)
 #define foreach_myList(cell, l)	for ((cell) = mylist_head(l); (cell) != NULL; (cell) = lnext(cell))
 
@@ -57,6 +58,9 @@ bool _equalmyList(myList *a, myList *b)
 bool _equalmyRelInfo(myRelInfo* a, myRelInfo* b)
 {
 	COMPARE_SCALAR_FIELD(relid);
+	#ifdef test
+		test_equalmyList();
+	#endif // test
 	if (!_equalmyList(a->RestrictClauseList, b->RestrictClauseList))
 		return false;
 	if (!_equalmyList(a->joininfo, b->joininfo))
@@ -80,7 +84,6 @@ bool _equalRestrictClause(RestrictClause* a, RestrictClause* b)
 /* Compare two History, if same, return true */
 bool _equalHistory(History* a, History* b)
 {
-	COMPARE_SCALAR_FIELD(selec);
 	if(_equalmyRelInfo(a->content, b->content))
 		return true;
 	return false;
@@ -123,21 +126,45 @@ bool my_equal(void* a, void* b)
 	switch (nodeTag(a))
 	{
 		case T_myList:
+		#ifdef test
+			if (test_equalmyList() == false)
+				ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmsg("_equalmyList wrong")));
+		#endif // test
 			retval = _equalmyList(a, b);
 			break;
 		case T_myVar:
+		#ifdef test
+			if (test_equalmyVar() == false)
+				ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmsg("_equalmyVar wrong")));
+		#endif // test
 			retval = _equalmyVar(a, b);
 			break;
 		case T_myConst:
+		#ifdef test
+			if (test_equalmyConst() == false)
+				ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmsg("_equalmyConst wrong")));
+		#endif // test
 			retval = _equalmyConst(a, b);
 			break;
 		case T_RestrictClause:
+		#ifdef test
+			if (test_equalRestrictClause() == false)
+				ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmsg("_equalRestrictClause wrong")));
+		#endif // test
 			retval = _equalRestrictClause(a, b);
 			break;
 		case T_myRelInfo:
+		#ifdef test
+			if (test_equalmyRelInfo() == false)
+				ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmsg("_equalmyRelInfo wrong")));
+		#endif // test
 			retval = _equalmyRelInfo(a, b);
 			break;
 		case T_History:
+		#ifdef test
+			if (test_equalHistory() == false)
+				ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmsg("_equalHistory wrong")));
+		#endif // test
 			retval = _equalHistory(a, b);
 			break;		
 	}
@@ -378,8 +405,11 @@ void* CreateNewHistory(const myRelInfo* rel)
 	History* temp = (History*)malloc(sizeof(History));
 	temp->type = T_History;
 	temp->content = rel;
-	temp->selec = -1.0;
 	temp->is_true = false;
+	temp->selec = (mySelectivity*)malloc(sizeof(mySelectivity));
+	temp->selec->max_selec = 1.0;
+	temp->selec->selec = 0.0;
+	temp->selec->min_selec = 0.0;
 	return temp;
 }
 /* Check myList CheckList find out if we meet this rel before ? */
@@ -411,7 +441,7 @@ void initial_myRelInfoArray(const PlannerInfo* root)
 */
 bool learn_from_history(const PlannerInfo* root, const RelOptInfo* joinrel,
 						const RelOptInfo* outer_rel, const RelOptInfo* inner_rel,
-						const List* joininfo, Selectivity* selec)
+						const List* joininfo, mySelectivity* myselec)
 {
 	/* If a RelOptInfo's relid unequal to 0, meaning it's a base relation. 
 	   And if we have not subtantialize this base relation, we make an entity for it. */
@@ -438,7 +468,7 @@ bool learn_from_history(const PlannerInfo* root, const RelOptInfo* joinrel,
 		rel = CreateNewRel(root, joinrel, outer_rel, inner_rel, joininfo);
 	}
 	/* If we have met this temporary relation before ? */
-	History* his = LookupHistory(rel, selec);
+	History* his = LookupHistory(rel);
 	if (his == NULL)
 	{
 		/* If not, we add this temporary relation to the list of History */
@@ -447,8 +477,12 @@ bool learn_from_history(const PlannerInfo* root, const RelOptInfo* joinrel,
 		/* And return false imply that we haven't met this temporary relation before */
 		return false;
 	}
-	if (his->selec > -1.0)
-		*selec = his->selec;
+	if (his->selec->selec > 0.0)
+	{
+		myselec->max_selec = his->selec->max_selec;
+		myselec->selec = his->selec->selec;
+		myselec->min_selec = his->selec->min_selec;
+	}
 	else
 		return false;
 	/* If yes, we return true, and the true selectivity has been assigned to input Selectivity* selec in the function LookupHistory() */
@@ -459,42 +493,39 @@ bool learn_from_history(const PlannerInfo* root, const RelOptInfo* joinrel,
 *  One relation's child relations store in t_array, another's in rel->chidRelList.
 *  We compare them and if they are same, return ture.
 */
-bool isEqualRel(const QueryDesc* queryDesc, myRelInfo* rel, const int* t_array)
+bool isEqualRel(const QueryDesc* queryDesc, myRelInfo* rel, const myRelInfo** left_array, const int lsize, const myRelInfo** right_array, const int rsize)
 {
 	int cnt = 0;
 	int i = 0;
-	while (t_array[i] != 0) {
-		i++;
-	}
-	int array_cnt = i;
 	myListCell* lc;
-	if (rel->leftList->length + rel->rightList->length != array_cnt)
+	if ((rel->leftList->length != lsize) || (rel->rightList->length != rsize))
 		return false;
 	foreach_myList(lc, rel->leftList)
 	{
-		for (int i = 0; t_array[i] != 0; i++)
+		for (int i = 0; i < lsize; i++)
 		{
-			if (((myRelInfo*)lc->data)->relid == t_array[i])
+			if (my_equal((myRelInfo*)lc->data, left_array[i]))
 			{
 				cnt++;
 				break;
 			}
 		}
 	}
-	if (rel->leftList->length != cnt)
+	if (lsize != cnt)
 		return false;
+	cnt = 0;
 	foreach_myList(lc, rel->rightList)
 	{
-		for (int i = 0; t_array[i] != 0; i++)
+		for (int i = 0; i < rsize; i++)
 		{
-			if (((myRelInfo*)lc->data)->relid == t_array[i])
+			if (my_equal((myRelInfo*)lc->data, right_array[i]))
 			{
 				cnt++;
 				break;
 			}
 		}
 	}
-	if (cnt == array_cnt)
+	if (rsize == cnt)
 	{
 		return true;
 	}
@@ -549,13 +580,15 @@ bool isSupRel(const QueryDesc* queryDesc, myRelInfo* rel, const int* t_array)
 /* FindComponent
 *  Get all the base relations this temporary relation(plan) has. 
 */
-void FindComponent(QueryDesc* queryDesc, Plan* plan, int* t_array) 
+int FindComponent(const QueryDesc* queryDesc, const Plan* plan, myRelInfo** t_array) 
 {
+	int ans = 0;
 	switch (plan->type)
 	{
 		case T_Scan:
 		case T_SeqScan:
 		case T_IndexScan:
+		case T_CteScan:
 		case T_BitmapIndexScan:
 		{
 			Scan* scanplan = (Scan*)plan;
@@ -564,16 +597,16 @@ void FindComponent(QueryDesc* queryDesc, Plan* plan, int* t_array)
 			{
 				i++;
 			}
-			t_array[i] = queryDesc->estate->es_range_table_array[scanplan->scanrelid - 1]->relid;
-			break;
+			t_array[i] = myRelInfoArray[scanplan->scanrelid];
+			return (i + 1);
 		}
 		default: 
 		{
 			if (plan->lefttree)
-				FindComponent(queryDesc, plan->lefttree, t_array);
+				ans = FindComponent(queryDesc, plan->lefttree, t_array);
 			if (plan->righttree)
-				FindComponent(queryDesc, plan->righttree, t_array);
-			break;
+				ans = FindComponent(queryDesc, plan->righttree, t_array);
+			return ans;
 		}
 	}
 }
@@ -601,115 +634,102 @@ int learnSelectivity(const QueryDesc* queryDesc, const PlanState* planstate)
 	{
 		return myRelInfoArray[((IndexScan*)plan)->scan.scanrelid]->tuples;
 	}
-	else if (plan->type == T_Hash)
+	else if (plan->type == T_CteScan)
 	{
-		return planstate->instrument->tuplecount;
+		return myRelInfoArray[((CteScan*)plan)->scan.scanrelid]->tuples;
 	}
 	int left_tuple = -1, right_tuple = -1;
 	History* his = (History*)NULL;
 	int n = queryDesc->estate->es_range_table_size + 1;
 	Assert(n > 1);
-	unsigned int* left_array = malloc(n * sizeof(unsigned int));
-	memset(left_array, 0, n * sizeof(unsigned int));
+	myRelInfo** left_array = (myRelInfo**)malloc(n * sizeof(myRelInfo*));
+	for (int i = 0; i < n; i++)
+	{
+		left_array[i] = NULL;
+	}
 	// Get the true cardinality of the lefttree if exists.
+	int lsize;
 	if (planstate->lefttree) {
 		left_tuple = learnSelectivity(queryDesc, planstate->lefttree);
-		FindComponent(queryDesc, planstate->lefttree->plan, left_array);
+		lsize = FindComponent(queryDesc, planstate->lefttree->plan, left_array);
 	}
-	unsigned int* right_array = malloc(n * sizeof(unsigned int));
-	memset(right_array, 0, n * sizeof(unsigned int));
+	myRelInfo** right_array = (myRelInfo**)malloc(n * sizeof(myRelInfo*));
+	for (int i = 0; i < n; i++)
+	{
+		right_array[i] = NULL;
+	}
 	// Get the true cardinality of the righttree if exists.
+	int rsize;
 	if (planstate->righttree){
 		right_tuple = learnSelectivity(queryDesc, planstate->righttree);
-		FindComponent(queryDesc, planstate->righttree->plan, right_array);
+		rsize = FindComponent(queryDesc, planstate->righttree->plan, right_array);
 	}
-	int lsize;
-	int rsize;
-	unsigned int* total_array = malloc(n * sizeof(unsigned int));
 	// The if clause is used to exclude T_Hash Node
 	if ((left_tuple != -1) && (right_tuple != -1)) {
 		/* This PlanState Node represent a temporary relation
 		*  And we need to find out the corresponding History
 		*/
-		memset(total_array, 0, n * sizeof(unsigned int));
-		for (lsize = 0; left_array[lsize] != 0; lsize++) {
-			total_array[lsize] = left_array[lsize];
-		}
-		for (rsize = 0; right_array[rsize] != 0; rsize++) {
-			total_array[lsize + rsize] = right_array[rsize];
-		}
 		myListCell *lc;
 		foreach_myList(lc, CheckList)
 		{
-			if (isEqualRel(queryDesc, ((History*)lc->data)->content, total_array))
+			if (isEqualRel(queryDesc, ((History*)lc->data)->content, left_array, lsize, right_array, rsize) || isEqualRel(queryDesc, ((History*)lc->data)->content, right_array, rsize, left_array, lsize))
 			{
+				/* If we find a corresponding History get the true selectivity */
 				his = ((History*)lc->data);
-				break;
+				his->selec->max_selec = planstate->instrument->tuplecount / left_tuple / right_tuple;
+				his->selec->selec = his->selec->max_selec;
+				his->selec->min_selec = his->selec->selec;
+				his->is_true = true;
 			}
 		}
 	}
-	if (his) {
-		/* If we find a corresponding History get the true selectivity */
-		his->selec = planstate->instrument->tuplecount / left_tuple / right_tuple;
-		his->is_true = true;
+	if (his)
+	{
 		//由高级表推断2级表的selectivity
-		if (lsize + rsize > 2) {
-			unsigned int t_array[3] = { 0, 0, 0 };
-			for (int i = 0; i < rsize; i++) {
-				for (int j = 0; j < lsize; j++) {
-					t_array[0] = right_array[i];
-					t_array[1] = left_array[j];
-					myListCell* lc;
-					History* temp = (History*)NULL;
-					foreach_myList(lc, CheckList)
-					{
-						//存在这样一个符合推断条件的2级表temp
-						if ((((History*)lc->data)->is_true == false) && (isEqualRel(queryDesc, ((History*)lc->data)->content, t_array)))
-						{
-							temp = ((History*)lc->data);
-							if (temp->selec == -1.0)
-								temp->selec = his->selec;
-							temp->selec = (temp->selec > his->selec)? his->selec : temp->selec;
-							break;
-						}
-					}
-					//由2级表temp推断高级表sup_temp的selectivity
-					/*if (temp)
-					{
-						myListCell* lc1;
-						foreach_myList(lc1, CheckList)
-						{
-							if ((((History*)lc1->data)->is_true == false) && (isSupRel(queryDesc, ((History*)lc1->data)->content, t_array)))
-							{
-								History* sup_temp = ((History*)lc1->data);
-								if (sup_temp->selec == -1.0)
-									sup_temp->selec = temp->selec;
-								sup_temp->selec = (temp->selec > sup_temp->selec) ? temp->selec : sup_temp->selec;
-							}
-						}
-					}*/
-				}
-			}
-		}
-		//由2级表his推断高级表sup_temp的selectivity
-		/*else
-		{
-			myListCell* lc;
-			foreach_myList(lc, CheckList)
-			{
-				if ((((History*)lc->data)->is_true == false) && (isSupRel(queryDesc, ((History*)lc->data)->content, total_array)))
-				{
-					History* sup_temp = ((History*)lc->data);
-					if (sup_temp->selec == -1.0)
-						sup_temp->selec = his->selec;
-					sup_temp->selec = (his->selec > sup_temp->selec) ? his->selec : sup_temp->selec;
-				}
-			}
-		}*/
+		check_two_level_rel(queryDesc, his, left_array, lsize, right_array, rsize);
 	}
 	/* Return the true cardinality of this Node */
 	free(left_array);
 	free(right_array);
-	free(total_array);
+	//For hash, we don't want to return the true rows, instead we want a estinated value, this is because we treat hash as a shell of a base relation.
+	if (plan->type == T_Hash)
+		return left_tuple;
 	return planstate->instrument->tuplecount;
+}
+void check_two_level_rel(
+	const QueryDesc* queryDesc, const History* his, 
+	const myRelInfo** left_array, const int lsize,
+	const myRelInfo** right_array, const int rsize)
+{
+	if (lsize + rsize > 2)
+	{
+		for (int i = 0; i < rsize; i++)
+		{
+			for (int j = 0; j < lsize; j++)
+			{
+				myListCell* lc;
+				History* temp = (History*)NULL;
+				foreach_myList(lc, CheckList)
+				{
+					//存在这样一个符合推断条件的2级表temp
+					if (
+						(((History*)lc->data)->is_true == false) && 
+						((isEqualRel(queryDesc, ((History*)lc->data)->content, left_array + j, 1, right_array + i, 1)
+						|| (isEqualRel(queryDesc, ((History*)lc->data)->content, right_array + i, 1, left_array + j, 1)))))
+					{
+						temp = ((History*)lc->data);
+						if (temp->selec->selec == 0.0) {
+							temp->selec->max_selec = 1.0;
+							temp->selec->selec = his->selec->selec;
+							temp->selec->min_selec = 0.0;
+						}
+						else {
+							temp->selec->selec = his->selec->selec;
+						}
+						break;
+					}
+				}
+			}
+		}
+	}
 }
