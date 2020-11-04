@@ -14,10 +14,12 @@
 
 #include "postgres.h"
 #include "executor/execdesc.h"
-#include "optimizer/pathnode.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodes.h"
 #include "nodes/pg_list.h"
+#include "optimizer/pathnode.h"
+
+#include "optimizer/mySelectivity.h"
 
 typedef struct myListCell myListCell;
 
@@ -129,14 +131,15 @@ typedef struct History
 	//Consider C = A join B
 	NodeTag type; // The type is T_History
 	myRelInfo* content; //The entity of this relation
-	Selectivity selec; // The selectivity
+	mySelectivity* selec; // The selectivity
 	bool is_true;
 } History;
 /* Because we always add same base relation into different temporary relations' childRelList, making an array of base relations let us don't need to substantialize base relation each time during a SQL query */
 void initial_myRelInfoArray(const PlannerInfo* root);
 /* When opimizer meet a temporary relation check if we meet it before. If so return the true selectivity, if not, add the relation into a list of history */
-bool learn_from_history(const PlannerInfo* root, const RelOptInfo* joinrel, const RelOptInfo* outter_rel, const RelOptInfo* inner_rel, const List* joininfo, 
-	Selectivity* selec);
+bool learn_from_history(
+	const PlannerInfo* root, const RelOptInfo* joinrel, const RelOptInfo* outter_rel, 
+	const RelOptInfo* inner_rel, const List* joininfo, mySelectivity* myselec);
 /* Get the true selectivity after executor */
 int learnSelectivity(const QueryDesc* queryDesc, const PlanState* planstate);
 bool my_equal(void* a, void* b);
@@ -151,8 +154,8 @@ void* getChildList(PlannerInfo* root, RelOptInfo* rel);
 myRelInfo* CreateNewRel(const PlannerInfo* root, const RelOptInfo* rel, const RelOptInfo* old_rel, const RelOptInfo* new_rel, const List* joininfo);
 void* CreateNewHistory(const myRelInfo* rel);
 History* LookupHistory(const myRelInfo* rel);
-bool isEqualRel(const QueryDesc* queryDesc, myRelInfo* rel, const int* t_array);
-bool isSupRel(const QueryDesc* queryDesc, myRelInfo* rel, const int* t_array);
-void FindComponent(QueryDesc* queryDesc, Plan* plan, int* t_array);
+bool isEqualRel(const QueryDesc* queryDesc, myRelInfo* rel, const myRelInfo** left_array, const int lsize, const myRelInfo** right_array, const int rsize);
+int FindComponent(const QueryDesc* queryDesc, const Plan* plan, myRelInfo** t_array);
 History* FindCorHistory(const QueryDesc* queryDesc, const Plan* plan);
+void check_two_level_rel(const QueryDesc* queryDesc, const History* his, const myRelInfo** left_array, const int lsize, const myRelInfo** right_array, const int rsize);
 #endif
