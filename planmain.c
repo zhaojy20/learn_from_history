@@ -18,10 +18,6 @@
  *
  *-------------------------------------------------------------------------
  */
-/*  Edited by zhaojy20.
-	Add new head file lfh.h in line 36.
-	Add new funciton initial_myRelInfoArray from lfh.c in line 270.
-*/
 #include "postgres.h"
 
 #include "optimizer/appendinfo.h"
@@ -267,7 +263,7 @@ query_planner(PlannerInfo *root,
 	 * from baserels to otherrels here, so we must have computed it already.
 	 */
 	add_other_rels_to_query(root);
-	initial_myRelInfoArray(root);
+	
 	/*
 	 * Ready to do the primary planning.
 	 */

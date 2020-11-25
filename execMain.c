@@ -377,6 +377,7 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 					execute_once);
 	}
 	learnSelectivity(queryDesc, queryDesc->planstate);
+	free_rtable();
 	/*
 	 * shutdown tuple receiver, if we started it
 	 */

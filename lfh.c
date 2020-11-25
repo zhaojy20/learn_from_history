@@ -21,9 +21,11 @@
 #define foreach_myList(cell, l)	for ((cell) = mylist_head(l); (cell) != NULL; (cell) = lnext(cell))
 
 myList* CheckList = ((myList*)NULL); // The list of sturct History
-static myRelInfo** myRelInfoArray; // The array for entity of base relations
+List* rtable;
 
 bool my_equal(void* a, void* b);
+void* getChildList(PlannerInfo * root, RelOptInfo * rel);
+void check_two_level_rel(QueryDesc * queryDesc, History * his, List * left_array, List * right_array);
 
 static inline myListCell* mylist_head(const myList * l)
 {
@@ -343,40 +345,19 @@ void* getRestrictClause(PlannerInfo* root, List* info)
 	}
 	return ans;
 }
-/* getChildList
-*  Get the input relation from Postgres, and find out the child relations the input joined before.
-*  Input is a RelOptInfo, rel->relids is a Bitmapset to record the child relations the rel joined before.
-*/
-void* getChildList(PlannerInfo* root, RelOptInfo* rel)
-{
-	myList* ans = (myList*)NULL;
-	if (rel->relid == 0)
-	{
-		Bitmapset* temp_bms;
-		temp_bms = bms_copy(rel->relids);
-		int x = 0;
-		while ((x = bms_first_member(temp_bms)) > 0)
-		{
-			myRelInfo* temp = myRelInfoArray[x];
-			ans = ListRenew(ans, temp);
-		}
-	}
-	else
-	{
-		myRelInfo* temp = myRelInfoArray[rel->relid];
-		ans = ListRenew(ans, temp);
-	}
-	return ans;
-}
 /* Make a entity of relation */
 myRelInfo* CreateNewRel(const PlannerInfo* root, const RelOptInfo* rel, const RelOptInfo* old_rel, const RelOptInfo* new_rel, const List* joininfo)
 {
+	if (rel->rtekind == RTE_SUBQUERY || rel->rtekind == RTE_CTE)
+	{
+		return (myRelInfo*)NULL;
+	}
 	myRelInfo* ans = (myRelInfo*)malloc(sizeof(myRelInfo));
 	ans->type = T_myRelInfo;
-	/* 
+	/*
 	*  If rel is a base relation, has no child relation and joininfo.
 	*/
-	if (rel->relid != 0)
+	if (rel->rtekind == RTE_RELATION)
 	{
 		ans->relid = root->simple_rte_array[rel->relid]->relid;
 		ans->leftList = (myList*)NULL;
@@ -388,7 +369,7 @@ myRelInfo* CreateNewRel(const PlannerInfo* root, const RelOptInfo* rel, const Re
 	/*
 	*  If rel is a temporary relation, child relation and joininfo is useful. But no restriction information because obviously the filter predicate is only applied on the base relation.
 	*/
-	else
+	else if (rel->rtekind == RTE_JOIN)
 	{
 		ans->relid = 0;
 		ans->leftList = getChildList(root, old_rel);
@@ -399,6 +380,33 @@ myRelInfo* CreateNewRel(const PlannerInfo* root, const RelOptInfo* rel, const Re
 	}
 	return ans;
 }
+/* getChildList
+*  Get the input relation from Postgres, and find out the child relations the input joined before.
+*  Input is a RelOptInfo, rel->relids is a Bitmapset to record the child relations the rel joined before.
+*/
+void* getChildList(PlannerInfo* root, RelOptInfo* rel)
+{
+	myList* ans = (myList*)NULL;
+	if (rel->rtekind == RTE_JOIN)
+	{
+		Bitmapset* temp_bms;
+		temp_bms = bms_copy(rel->relids);
+		int x = 0;
+		while ((x = bms_first_member(temp_bms)) > 0)
+		{
+			myRelInfo* temp = CreateNewRel(root, root->simple_rel_array[x], NULL, NULL, NULL);
+			if (temp)
+				ans = ListRenew(ans, temp);
+		}
+	}
+	else if(rel->rtekind == RTE_RELATION)
+	{
+		myRelInfo* temp = CreateNewRel(root, rel, NULL, NULL, NULL);
+		ans = ListRenew(ans, temp);
+	}
+	return ans;
+}
+
 /* Create a new History */
 void* CreateNewHistory(const myRelInfo* rel)
 {
@@ -426,14 +434,22 @@ History* LookupHistory(const myRelInfo* rel)
 	}
 	return NULL;
 }
-/* initialize the array myRelInfoArray */
-void initial_myRelInfoArray(const PlannerInfo* root)
+
+void initial_rtable(const PlannerInfo* root)
 {
-	int n;
-	n = root->simple_rel_array_size + 1;
-	myRelInfoArray = (myRelInfo**)palloc0(n * sizeof(myRelInfo*));
+	for (int i = 1; i < root->simple_rel_array_size; i++)
+	{
+		if (root->simple_rel_array[i] == NULL)
+			continue;
+		myRelInfo* rel = CreateNewRel(root, root->simple_rel_array[i], NULL, NULL, NULL);
+		rtableCell* rc = palloc(sizeof(rtableCell));
+		rc->rel = rel;
+		rc->name = root->simple_rte_array[i]->eref->aliasname;
+		rtable = lappend(rtable, rc);
+	}
 }
-/* learn_from_history 
+
+/* learn_from_history
 *  Whenever caculating a cardinality of a temporary relation, the optimizer call this function.
 *  The input joinrel is the temporary relation, inner_rel and outer_rel is joinrel's subtree.
 *  If the joinrel we have met before this SQL query, we return the true selectivity instead of use Postgres's estimation.
@@ -443,28 +459,16 @@ bool learn_from_history(const PlannerInfo* root, const RelOptInfo* joinrel,
 						const RelOptInfo* outer_rel, const RelOptInfo* inner_rel,
 						const List* joininfo, mySelectivity* myselec)
 {
-	/* If a RelOptInfo's relid unequal to 0, meaning it's a base relation. 
-	   And if we have not subtantialize this base relation, we make an entity for it. */
-	if ((outer_rel->relid != 0) && (myRelInfoArray[outer_rel->relid] == NULL))
-	{
-		/* Make a entity of a base relation */
-		myRelInfo* rel = CreateNewRel(root, outer_rel, NULL, NULL, joininfo);
-		/* Add it to the myRelInfoArray */
-		myRelInfoArray[outer_rel->relid] = rel;
-	}
-	if ((inner_rel->relid != 0) && (myRelInfoArray[inner_rel->relid] == NULL))
-	{
-		/* Make a entity of a base relation */
-		myRelInfo* rel = CreateNewRel(root, inner_rel, NULL, NULL, joininfo);
-		/* Add it to the myRelInfoArray */
-		myRelInfoArray[inner_rel->relid] = rel;
-	}
 	myRelInfo* rel;
-	if (outer_rel->relid != 0) {
+	if (outer_rel->rtekind == RTE_SUBQUERY || inner_rel->rtekind == RTE_SUBQUERY)
+		return false;
+	if (outer_rel->rtekind == RTE_RELATION) 
+	{
 		/* Make a entity of a temporary relation */
 		rel = CreateNewRel(root, joinrel, inner_rel, outer_rel, joininfo);
 	}
-	else {
+	else
+	{
 		rel = CreateNewRel(root, joinrel, outer_rel, inner_rel, joininfo);
 	}
 	/* If we have met this temporary relation before ? */
@@ -493,39 +497,44 @@ bool learn_from_history(const PlannerInfo* root, const RelOptInfo* joinrel,
 *  One relation's child relations store in t_array, another's in rel->chidRelList.
 *  We compare them and if they are same, return ture.
 */
-bool isEqualRel(const QueryDesc* queryDesc, myRelInfo* rel, const myRelInfo** left_array, const int lsize, const myRelInfo** right_array, const int rsize)
+bool isEqualRel(const QueryDesc* queryDesc, myRelInfo* rel, const List* left_array, const List* right_array)
 {
 	int cnt = 0;
 	int i = 0;
-	myListCell* lc;
-	if ((rel->leftList->length != lsize) || (rel->rightList->length != rsize))
+	myListCell* lc1;
+	ListCell* lc2;
+	if (left_array == NULL || right_array == NULL)
 		return false;
-	foreach_myList(lc, rel->leftList)
+	if ((rel->leftList == NULL) || (rel->rightList == NULL))
+		return false;
+	if ((rel->leftList->length != left_array->length) || (rel->rightList->length != right_array->length))
+		return false;
+	foreach_myList(lc1, rel->leftList)
 	{
-		for (int i = 0; i < lsize; i++)
+		foreach (lc2, left_array)
 		{
-			if (my_equal((myRelInfo*)lc->data, left_array[i]))
+			if (my_equal((myRelInfo*)lc1->data, (myRelInfo*)lc2->data.ptr_value))
 			{
 				cnt++;
 				break;
 			}
 		}
 	}
-	if (lsize != cnt)
+	if (left_array->length != cnt)
 		return false;
 	cnt = 0;
-	foreach_myList(lc, rel->rightList)
+	foreach_myList(lc1, rel->rightList)
 	{
-		for (int i = 0; i < rsize; i++)
+		foreach(lc2, right_array)
 		{
-			if (my_equal((myRelInfo*)lc->data, right_array[i]))
+			if (my_equal((myRelInfo*)lc1->data, (myRelInfo*)lc2->data.ptr_value))
 			{
 				cnt++;
 				break;
 			}
 		}
 	}
-	if (rsize == cnt)
+	if (right_array->length == cnt)
 	{
 		return true;
 	}
@@ -540,7 +549,8 @@ bool isSupRel(const QueryDesc* queryDesc, myRelInfo* rel, const int* t_array)
 {
 	int cnt = 0;
 	int i = 0;
-	while (t_array[i] != 0) {
+	while (t_array[i] != 0)
+	{
 		i++;
 	}
 	int array_cnt = i;
@@ -577,10 +587,24 @@ bool isSupRel(const QueryDesc* queryDesc, myRelInfo* rel, const int* t_array)
 	}
 	return false;
 }
+
+myRelInfo* find_rtable(RangeTblEntry** rte_array, Index index)
+{
+	int level = rtable->length;
+	RangeTblEntry* rte = rte_array[index];
+	ListCell* lc = rtable->head;
+	foreach(lc, rtable)
+	{
+		if (strcmp(((rtableCell*)lc->data.ptr_value)->name, rte->eref->aliasname) == 0)
+			return ((rtableCell*)lc->data.ptr_value)->rel;
+	}
+	return NULL;
+}
+
 /* FindComponent
 *  Get all the base relations this temporary relation(plan) has. 
 */
-int FindComponent(const QueryDesc* queryDesc, const Plan* plan, myRelInfo** t_array) 
+List* FindComponent(const QueryDesc* queryDesc, const Plan* plan, List* t_array) 
 {
 	int ans = 0;
 	switch (plan->type)
@@ -592,21 +616,18 @@ int FindComponent(const QueryDesc* queryDesc, const Plan* plan, myRelInfo** t_ar
 		case T_BitmapIndexScan:
 		{
 			Scan* scanplan = (Scan*)plan;
-			int i = 0;
-			while (t_array[i] != 0)
-			{
-				i++;
-			}
-			t_array[i] = myRelInfoArray[scanplan->scanrelid];
-			return (i + 1);
+			myRelInfo* rel = find_rtable(queryDesc->estate->es_range_table_array, scanplan->scanrelid - 1);
+			if(rel)
+				t_array = lappend(t_array, rel);
+			return t_array;
 		}
 		default: 
 		{
 			if (plan->lefttree)
-				ans = FindComponent(queryDesc, plan->lefttree, t_array);
+				t_array = FindComponent(queryDesc, plan->lefttree, t_array);
 			if (plan->righttree)
-				ans = FindComponent(queryDesc, plan->righttree, t_array);
-			return ans;
+				t_array = FindComponent(queryDesc, plan->righttree, t_array);
+			return t_array;
 		}
 	}
 }
@@ -620,7 +641,7 @@ int learnSelectivity(const QueryDesc* queryDesc, const PlanState* planstate)
 	// When we meet SeqScan, we reach the end of PlanState tree.
 	if (plan->type == T_SeqScan)
 	{
-		return myRelInfoArray[((SeqScan*)plan)->scanrelid]->tuples;
+		return find_rtable(queryDesc->estate->es_range_table_array, ((SeqScan*)plan)->scanrelid - 1)->tuples;
 	}
 	else if (plan->type == T_BitmapHeapScan)
 	{
@@ -628,51 +649,62 @@ int learnSelectivity(const QueryDesc* queryDesc, const PlanState* planstate)
 	}
 	else if (plan->type == T_BitmapIndexScan)
 	{
-		return myRelInfoArray[((BitmapIndexScan*)plan)->scan.scanrelid]->tuples;
+		return find_rtable(queryDesc->estate->es_range_table_array, ((BitmapIndexScan*)plan)->scan.scanrelid - 1)->tuples;
 	}
 	else if (plan->type == T_IndexScan)
 	{
-		return myRelInfoArray[((IndexScan*)plan)->scan.scanrelid]->tuples;
+		return find_rtable(queryDesc->estate->es_range_table_array, ((IndexScan*)plan)->scan.scanrelid - 1)->tuples;
 	}
 	else if (plan->type == T_CteScan)
 	{
-		return myRelInfoArray[((CteScan*)plan)->scan.scanrelid]->tuples;
+		return 0;
+	}
+	else if (plan->type == T_IndexOnlyScan)
+	{
+		return find_rtable(queryDesc->estate->es_range_table_array, ((IndexOnlyScan*)plan)->scan.scanrelid - 1)->tuples;
 	}
 	int left_tuple = -1, right_tuple = -1;
 	History* his = (History*)NULL;
-	int n = queryDesc->estate->es_range_table_size + 1;
-	Assert(n > 1);
-	myRelInfo** left_array = (myRelInfo**)malloc(n * sizeof(myRelInfo*));
-	for (int i = 0; i < n; i++)
-	{
-		left_array[i] = NULL;
-	}
+	List* left_array = NIL;
 	// Get the true cardinality of the lefttree if exists.
-	int lsize;
-	if (planstate->lefttree) {
-		left_tuple = learnSelectivity(queryDesc, planstate->lefttree);
-		lsize = FindComponent(queryDesc, planstate->lefttree->plan, left_array);
-	}
-	myRelInfo** right_array = (myRelInfo**)malloc(n * sizeof(myRelInfo*));
-	for (int i = 0; i < n; i++)
+	if (planstate->lefttree)
 	{
-		right_array[i] = NULL;
+		if (planstate->lefttree->type == T_SubqueryScanState)
+		{
+			left_tuple = learnSelectivity(queryDesc, ((SubqueryScanState*)planstate->lefttree)->subplan);
+			left_array = FindComponent(queryDesc, ((SubqueryScanState*)planstate->lefttree)->subplan->plan, left_array);
+		}
+		else
+		{
+			left_tuple = learnSelectivity(queryDesc, planstate->lefttree);
+			left_array = FindComponent(queryDesc, planstate->lefttree->plan, left_array);
+		}
 	}
+	List* right_array = NIL;
 	// Get the true cardinality of the righttree if exists.
-	int rsize;
-	if (planstate->righttree){
-		right_tuple = learnSelectivity(queryDesc, planstate->righttree);
-		rsize = FindComponent(queryDesc, planstate->righttree->plan, right_array);
+	if (planstate->righttree)
+	{
+		if (planstate->righttree->type == T_SubqueryScanState)
+		{
+			right_tuple = learnSelectivity(queryDesc, ((SubqueryScanState*)planstate->righttree)->subplan);
+			right_array = FindComponent(queryDesc, ((SubqueryScanState*)planstate->righttree)->subplan->plan, right_array);
+		}
+		else
+		{
+			right_tuple = learnSelectivity(queryDesc, planstate->righttree);
+			right_array = FindComponent(queryDesc, planstate->righttree->plan, right_array);
+		}
 	}
 	// The if clause is used to exclude T_Hash Node
-	if ((left_tuple != -1) && (right_tuple != -1)) {
+	if ((left_tuple > 0) && (right_tuple > 0))
+	{
 		/* This PlanState Node represent a temporary relation
 		*  And we need to find out the corresponding History
 		*/
 		myListCell *lc;
 		foreach_myList(lc, CheckList)
 		{
-			if (isEqualRel(queryDesc, ((History*)lc->data)->content, left_array, lsize, right_array, rsize) || isEqualRel(queryDesc, ((History*)lc->data)->content, right_array, rsize, left_array, lsize))
+			if (isEqualRel(queryDesc, ((History*)lc->data)->content, left_array, right_array) || isEqualRel(queryDesc, ((History*)lc->data)->content, right_array, left_array))
 			{
 				/* If we find a corresponding History get the true selectivity */
 				his = ((History*)lc->data);
@@ -686,44 +718,48 @@ int learnSelectivity(const QueryDesc* queryDesc, const PlanState* planstate)
 	if (his)
 	{
 		//由高级表推断2级表的selectivity
-		check_two_level_rel(queryDesc, his, left_array, lsize, right_array, rsize);
+		check_two_level_rel(queryDesc, his, left_array, right_array);
 	}
 	/* Return the true cardinality of this Node */
-	free(left_array);
-	free(right_array);
 	//For hash, we don't want to return the true rows, instead we want a estinated value, this is because we treat hash as a shell of a base relation.
 	if (plan->type == T_Hash)
 		return left_tuple;
 	return planstate->instrument->tuplecount;
 }
 void check_two_level_rel(
-	const QueryDesc* queryDesc, const History* his, 
-	const myRelInfo** left_array, const int lsize,
-	const myRelInfo** right_array, const int rsize)
+	QueryDesc* queryDesc, History* his, 
+	List* left_array, List* right_array)
 {
-	if (lsize + rsize > 2)
+	if (left_array->length + right_array->length > 2)
 	{
-		for (int i = 0; i < rsize; i++)
+		ListCell* lc1;
+		ListCell* lc2;
+		foreach (lc1, left_array)
 		{
-			for (int j = 0; j < lsize; j++)
+			foreach (lc2, right_array)
 			{
 				myListCell* lc;
 				History* temp = (History*)NULL;
 				foreach_myList(lc, CheckList)
 				{
+					List* ll = NIL;
+					List* lr = NIL;
+					ll = lappend(ll, lc1->data.ptr_value);
+					lr = lappend(lr, lc2->data.ptr_value);
 					//存在这样一个符合推断条件的2级表temp
-					if (
-						(((History*)lc->data)->is_true == false) && 
-						((isEqualRel(queryDesc, ((History*)lc->data)->content, left_array + j, 1, right_array + i, 1)
-						|| (isEqualRel(queryDesc, ((History*)lc->data)->content, right_array + i, 1, left_array + j, 1)))))
+					if((((History*)lc->data)->is_true == false) && 
+						((isEqualRel(queryDesc, ((History*)lc->data)->content, ll, lr)
+						|| (isEqualRel(queryDesc, ((History*)lc->data)->content, lr, ll)))))
 					{
 						temp = ((History*)lc->data);
-						if (temp->selec->selec == 0.0) {
+						if (temp->selec->selec == 0.0)
+						{
 							temp->selec->max_selec = 1.0;
 							temp->selec->selec = his->selec->selec;
 							temp->selec->min_selec = 0.0;
 						}
-						else {
+						else
+						{
 							temp->selec->selec = his->selec->selec;
 						}
 						break;
@@ -732,4 +768,9 @@ void check_two_level_rel(
 			}
 		}
 	}
+}
+
+void free_rtable()
+{
+	rtable = NIL;
 }

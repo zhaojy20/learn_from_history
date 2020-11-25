@@ -134,28 +134,19 @@ typedef struct History
 	mySelectivity* selec; // The selectivity
 	bool is_true;
 } History;
+typedef struct rtableCell
+{
+	//Consider C = A join B
+	myRelInfo* rel; // The type is T_History
+	char* name;
+} rtableCell;
 /* Because we always add same base relation into different temporary relations' childRelList, making an array of base relations let us don't need to substantialize base relation each time during a SQL query */
-void initial_myRelInfoArray(const PlannerInfo* root);
 /* When opimizer meet a temporary relation check if we meet it before. If so return the true selectivity, if not, add the relation into a list of history */
 bool learn_from_history(
 	const PlannerInfo* root, const RelOptInfo* joinrel, const RelOptInfo* outter_rel, 
 	const RelOptInfo* inner_rel, const List* joininfo, mySelectivity* myselec);
 /* Get the true selectivity after executor */
 int learnSelectivity(const QueryDesc* queryDesc, const PlanState* planstate);
-bool my_equal(void* a, void* b);
-void* my_copyVar(PlannerInfo* root, const Var* from);
-void* my_copyConst(PlannerInfo* root, const Const* from);
-void* my_copyRelInfo(PlannerInfo* root, const myRelInfo* from);
-myList* ListRenew(myList* l, void* p);
-void* getExpr(PlannerInfo* root, Node* expr);
-void* getLeftandRight(PlannerInfo* root, RestrictClause* rc, Expr* clause);
-void* getRestrictClause(PlannerInfo* root, List* info);
-void* getChildList(PlannerInfo* root, RelOptInfo* rel);
-myRelInfo* CreateNewRel(const PlannerInfo* root, const RelOptInfo* rel, const RelOptInfo* old_rel, const RelOptInfo* new_rel, const List* joininfo);
-void* CreateNewHistory(const myRelInfo* rel);
-History* LookupHistory(const myRelInfo* rel);
-bool isEqualRel(const QueryDesc* queryDesc, myRelInfo* rel, const myRelInfo** left_array, const int lsize, const myRelInfo** right_array, const int rsize);
-int FindComponent(const QueryDesc* queryDesc, const Plan* plan, myRelInfo** t_array);
-History* FindCorHistory(const QueryDesc* queryDesc, const Plan* plan);
-void check_two_level_rel(const QueryDesc* queryDesc, const History* his, const myRelInfo** left_array, const int lsize, const myRelInfo** right_array, const int rsize);
+void free_rtable();
+void initial_rtable(const PlannerInfo* root);
 #endif
